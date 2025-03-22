@@ -1,0 +1,263 @@
+---
+- hosts: all
+  become: yes
+  vars_files:
+    - common_vars.yml
+  tasks:
+    - name: Update and upgrade apt packages
+      apt:
+        update_cache: yes
+        upgrade: yes
+
+    - name: Install essential system packages
+      apt:
+        name:
+          - curl
+          - git
+          - build-essential
+          - nfs-common
+          - ca-certificates
+          - apt-transport-https
+          - gnupg
+          - software-properties-common
+          - containerd
+          - htop
+          - unzip
+          - net-tools
+        state: present
+
+    - name: Ensure NTP is installed and running
+      apt:
+        name: ntp
+        state: present
+      notify: Restart NTP
+
+    - name: Ensure swap is disabled permanently
+      replace:
+        path: /etc/fstab
+        regexp: '^(.*\sswap\s.*)$'
+        replace: '#\1'
+
+    - name: Disable swap immediately
+      command: swapoff -a
+
+    - name: Enable IP forwarding for Kubernetes networking
+      lineinfile:
+        path: /etc/sysctl.conf
+        line: 'net.ipv4.ip_forward = 1'
+        create: yes
+
+    - name: Apply sysctl settings
+      command: sysctl -p
+
+    - name: Create necessary model directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /models/triton/model_repo
+        - /models/ollama
+
+  handlers:
+    - name: Restart NTP
+      service:
+        name: ntp
+        state: restarted
+
+- hosts: all
+  become: yes
+  vars_files:
+    - common_vars.yml
+  tasks:
+    - name: Verify Helm chart repositories exist
+      command: helm repo list
+      register: helm_repo_list
+      failed_when: helm_repo_list.rc not in [0, 1]
+
+    - name: Install Helm
+      shell: curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      args:
+        executable: /bin/bash
+
+    - name: Add NVIDIA PPA
+      apt_repository:
+        repo: "ppa:graphics-drivers/ppa"
+        state: present
+
+    - name: Update APT cache after adding NVIDIA PPA
+      apt:
+        update_cache: yes
+
+    - name: Install NVIDIA driver (version 535)
+      apt:
+        name: "nvidia-driver-535"
+        state: present
+
+    - name: Check if NVIDIA driver is active
+      command: nvidia-smi
+      register: nvidia_smi_check
+      ignore_errors: yes
+
+    - name: Set flag to indicate reboot is required after NVIDIA driver installation
+      file:
+        path: /tmp/ansible_reboot_required
+        state: touch
+      when: nvidia_smi_check.rc != 0
+
+    - name: Check if reboot flag exists
+      stat:
+        path: /tmp/ansible_reboot_required
+      register: reboot_flag
+
+    - name: Reboot if needed after installing NVIDIA drivers
+      reboot:
+        msg: "Rebooting to apply NVIDIA driver"
+        pre_reboot_delay: 5
+        post_reboot_delay: 30
+        test_command: "nvidia-smi"
+      when: reboot_flag.stat.exists
+
+    - name: Remove reboot flag after successful reboot
+      file:
+        path: /tmp/ansible_reboot_required
+        state: absent
+      when: reboot_flag.stat.exists
+
+    - name: Wait for system to come back online
+      wait_for_connection:
+        delay: 30
+        timeout: 600
+
+    - name: Ensure keyrings directory exists for Kubernetes keys
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Add Kubernetes Repository Key via keyring method (dearmored)
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.32/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-archive-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-archive-keyring.gpg
+
+    - name: Add Kubernetes APT repository
+      copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: |
+          deb [signed-by=/etc/apt/keyrings/kubernetes-archive-keyring.gpg] https://prod-cdn.packages.k8s.io/repositories/isv:/kubernetes:/core:/stable:/v1.32/deb/ /
+
+    - name: Update APT cache after adding Kubernetes repo
+      apt:
+        update_cache: yes
+
+    - name: Install Kubernetes Components
+      apt:
+        name:
+          - "kubeadm={{ kube_version }}"
+          - "kubelet={{ kube_version }}"
+          - "kubectl={{ kube_version }}"
+        state: present
+        allow_downgrade: yes
+
+    - name: Enable and Start containerd
+      systemd:
+        name: containerd
+        enabled: yes
+        state: started
+
+    - name: Enable and Start kubelet
+      systemd:
+        name: kubelet
+        enabled: yes
+        state: started
+
+    - name: Check if container runtime is running
+      command: systemctl is-active --quiet containerd
+      register: containerd_status
+      failed_when: containerd_status.rc != 0
+
+    - name: Initialize Kubernetes (If Not Initialized) on Master
+      command: kubeadm init --pod-network-cidr=192.168.0.0/16
+      args:
+        creates: /etc/kubernetes/admin.conf
+      when: "'k8s_master' in group_names"
+
+    - name: Wait for Kubernetes API Server to become available on Master
+      wait_for:
+        host: "{{ ansible_host }}"
+        port: 6443
+        timeout: 300
+      when: "'k8s_master' in group_names"
+
+    - name: Check Kubernetes API health on Master
+      command: kubectl get --raw='/readyz'
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: api_health
+      retries: 5
+      delay: 15
+      until: "'ok' in api_health.stdout"
+      when: "'k8s_master' in group_names"
+
+    - name: Deploy Calico Network Plugin on Master
+      command: kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: "'k8s_master' in group_names"
+
+    - name: Wait for Calico pods to be ready on Master
+      command: kubectl get pods -n kube-system | grep calico | grep Running
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: calico_status
+      retries: 10
+      delay: 15
+      until: "'Running' in calico_status.stdout"
+      when: "'k8s_master' in group_names"
+
+    - name: Verify Kubernetes API Server is Running on Master
+      command: ss -tulnp | grep 6443
+      register: kube_api_status
+      failed_when: kube_api_status.rc != 0
+      when: "'k8s_master' in group_names"
+
+    - name: Comprehensive post-installation checks on Master
+      command: kubectl get all -A
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: cluster_health
+      failed_when: cluster_health.rc != 0
+      when: "'k8s_master' in group_names"
+
+    - name: Pause for manual verification before proceeding on Master
+      pause:
+        prompt: "Check if Kubernetes is running properly (kubectl cluster-info). Press Enter to continue to networking setup."
+        minutes: 5
+      when: "'k8s_master' in group_names"
+
+- hosts: all
+  become: yes
+  vars_files:
+    - common_vars.yml
+  tasks:
+    - name: Retrieve Kubernetes Dashboard Token (Master Only)
+      shell: kubectl -n kubernetes-dashboard create token admin-user
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: k8s_dashboard_token
+      when: "'k8s_master' in group_names"
+
+    - name: Display Deployment Summary (Master Only)
+      debug:
+        msg:
+          - "Kubernetes cluster setup completed successfully."
+          - "Use 'kubectl get nodes' to verify node status."
+          - "Kubernetes Dashboard: https://{{ ansible_host }}:6443"
+          - "Run 'kubectl cluster-info' to check cluster status."
+          - "Kubernetes Dashboard Token: {{ k8s_dashboard_token.stdout | default('Token not retrieved') }}"
+          - "Prometheus: http://192.168.20.20:9090"
+          - "Grafana: http://192.168.20.21:3000 (User: admin, Password: prom-operator)"
+          - "Triton Inference Server: http://192.168.20.22:8000"
+          - "Ollama: http://192.168.20.23:11434"
+          - "OpenWebUI: http://192.168.20.24:3001 (Default User: admin, Password: admin123)"

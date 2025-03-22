@@ -1,0 +1,15 @@
+# First create a vars file to hold all variables
+# File: k8s_vars.yml
+---
+kube_version: "1.32.3-1.1"
+cni_plugin: "calico"
+cni_version: "v3.26.1"
+metallb_version: "v0.13.12"
+metallb_ip_range: "192.168.20.20-192.168.20.24"
+containerd_config_dir: "/etc/containerd"
+dashboard_version: "v2.7.0"
+monitoring_namespace: "monitoring"
+gpu_operator_namespace: "gpu-operator"
+ollama_namespace: "ollama"
+triton_namespace: "triton-inference"
+openwebui_namespace: "openwebui"

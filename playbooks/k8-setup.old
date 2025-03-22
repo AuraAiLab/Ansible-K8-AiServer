@@ -1,0 +1,211 @@
+---
+- hosts: k8s_nodes
+  become: yes
+  tasks:
+    - name: Update and upgrade apt packages
+      apt:
+        update_cache: yes
+        upgrade: yes
+
+    - name: Check if essential system packages are installed
+      shell: dpkg -l | grep -q "{{ item }}"
+      register: package_installed
+      ignore_errors: true
+      loop:
+        - curl
+        - git
+        - build-essential
+        - nfs-common
+        - ca-certificates
+        - apt-transport-https
+        - gnupg
+        - software-properties-common
+        - containerd
+        - htop
+        - unzip
+        - net-tools
+
+    - name: Install essential system packages
+      apt:
+        name: "{{ item }}"
+        state: present
+      when: "'install ok installed' not in package_installed.results | selectattr('item', 'equalto', item) | map(attribute='stdout') | list"
+      loop:
+        - curl
+        - git
+        - build-essential
+        - nfs-common
+        - ca-certificates
+        - apt-transport-https
+        - gnupg
+        - software-properties-common
+        - containerd
+        - htop
+        - unzip
+        - net-tools
+
+    - name: Ensure NTP is installed and running
+      apt:
+        name: ntp
+        state: present
+      notify: Restart NTP
+
+    - name: Enable IP forwarding for Kubernetes networking
+      lineinfile:
+        path: /etc/sysctl.conf
+        line: 'net.ipv4.ip_forward = 1'
+        create: yes
+
+    - name: Apply sysctl settings
+      command: sysctl -p
+
+    - name: Create necessary model directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /models/triton/model_repo
+        - /models/ollama
+
+  handlers:
+    - name: Restart NTP
+      service:
+        name: ntp
+        state: restarted
+
+- hosts: k8s_nodes
+  become: yes
+  tasks:
+    - name: Add NVIDIA PPA
+      apt_repository:
+        repo: "ppa:graphics-drivers/ppa"
+        state: present
+
+    - name: Update APT cache
+      apt:
+        update_cache: yes
+
+    - name: Check if NVIDIA driver is installed
+      shell: dpkg -l | grep -q nvidia-driver-535
+      register: nvidia_installed
+      ignore_errors: true
+
+    - name: Install NVIDIA driver (version 535)
+      apt:
+        name: "nvidia-driver-535"
+        state: present
+      when: nvidia_installed is failed
+
+    - name: Reboot if needed after installing NVIDIA drivers
+      command: shutdown -r now "Rebooting to apply NVIDIA drivers"
+      async: 1
+      poll: 0
+      ignore_errors: true
+      when: nvidia_installed is failed
+
+    - name: Pause for system reboot
+      pause:
+        seconds: 30
+
+    - name: Wait for system to come back online
+      wait_for_connection:
+        delay: 30
+        timeout: 600
+
+    - name: Ensure the server is reachable
+      ansible.builtin.ping:
+
+    - name: Wait for system to come back online
+      wait_for_connection:
+        delay: 30
+        timeout: 600
+
+    - name: Add Kubernetes signing key
+      ansible.builtin.apt_key:
+        keyserver: keyserver.ubuntu.com
+        id: 234654DA9A296436
+        state: present
+
+    - name: Update APT cache
+      apt:
+        update_cache: yes
+
+    - name: Add Kubernetes APT repository
+      apt_repository:
+        repo: "deb https://pkgs.k8s.io/core:/stable:/v1.32/deb/ /"
+        state: present
+
+    - name: Check if Kubernetes components are installed
+      shell: dpkg -l | grep -q "{{ item }}"
+      register: kubernetes_installed
+      ignore_errors: true
+      loop:
+        - kubeadm=1.32.*
+        - kubelet=1.32.*
+        - kubectl=1.32.*
+
+    - name: Install Kubernetes components
+      apt:
+        name: "{{ item }}"
+        state: present
+      when: "'install ok installed' not in kubernetes_installed.results | selectattr('item', 'equalto', item) | map(attribute='stdout') | list"
+      loop:
+        - kubeadm=1.32.*
+        - kubelet=1.32.*
+        - kubectl=1.32.*
+
+    - name: Restart containerd to ensure it is running
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+
+    - name: Initialize Kubernetes cluster with Calico pod network
+      shell: kubeadm init --control-plane-endpoint="{{ ansible_host }}" --pod-network-cidr=10.10.0.0/16
+      when: "'master' in inventory_hostname"
+
+    - name: Copy kubeconfig for user
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/{{ ansible_user }}/.kube/config
+        remote_src: yes
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0600'
+      when: "'master' in inventory_hostname"
+
+    - name: Retrieve Kubernetes Dashboard Token
+      shell: kubectl -n kubernetes-dashboard create token admin-user
+      register: k8s_dashboard_token
+      when: "'master' in inventory_hostname"
+
+    - name: Install MetalLB for external Load Balancing
+      shell: |
+        kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/main/manifests/metallb-native.yaml
+        kubectl create -f - <<EOF
+        apiVersion: metallb.io/v1beta1
+        kind: IPAddressPool
+        metadata:
+          name: default-pool
+          namespace: metallb-system
+        spec:
+          addresses:
+          - 192.168.20.20-192.168.20.24
+        EOF
+      when: "'master' in inventory_hostname"
+
+- hosts: k8s_nodes
+  become: yes
+  tasks:
+    - name: Display Deployment Summary
+      debug:
+        msg:
+          - "Cluster Name: AuraAi-K8Clstr"
+          - "Kubernetes Dashboard: https://{{ ansible_host }}:6443"
+          - "Kubernetes Dashboard Token: {{ k8s_dashboard_token.stdout }}"
+          - "Prometheus: http://192.168.20.20:9090"
+          - "Grafana: http://192.168.20.21:3000 (User: admin, Password: prom-operator)"
+          - "Triton Inference Server: http://192.168.20.22:8000"
+          - "Ollama: http://192.168.20.23:11434"
+          - "OpenWebUI: http://192.168.20.24:3001 (Default User: admin, Password: admin123)"

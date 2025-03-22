@@ -1,0 +1,327 @@
+---
+- hosts: all
+  become: yes
+  vars:
+    kube_version: "1.32.2-1.1"
+    cni_plugin: "calico"
+    metallb_ip_range: "192.168.20.20-192.168.20.24"
+  tasks:
+    - name: Update and upgrade apt packages
+      apt:
+        update_cache: yes
+        upgrade: yes
+
+    - name: Install essential system packages
+      apt:
+        name:
+          - curl
+          - git
+          - build-essential
+          - nfs-common
+          - ca-certificates
+          - apt-transport-https
+          - gnupg
+          - software-properties-common
+          - containerd
+          - htop
+          - unzip
+          - net-tools
+        state: present
+
+    - name: Ensure NTP is installed and running
+      apt:
+        name: ntp
+        state: present
+      notify: Restart NTP
+
+    - name: Ensure swap is disabled permanently
+      replace:
+        path: /etc/fstab
+        regexp: '^(.*\\sswap\\s.*)$'
+        replace: '#\1'
+
+    - name: Disable swap immediately
+      command: swapoff -a
+
+    - name: Enable IP forwarding for Kubernetes networking
+      lineinfile:
+        path: /etc/sysctl.conf
+        line: 'net.ipv4.ip_forward = 1'
+        create: yes
+
+    - name: Apply sysctl settings
+      command: sysctl -p
+
+    - name: Create necessary model directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /models/triton/model_repo
+        - /models/ollama
+
+  handlers:
+    - name: Restart NTP
+      service:
+        name: ntp
+        state: restarted
+
+- hosts: all
+  become: yes
+  tasks:
+
+    - name: Verify Helm chart repositories exist
+      shell: helm repo list
+      register: helm_repo_list
+      failed_when: helm_repo_list.rc != 0
+
+    - name: Install Helm
+      shell: |
+        curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+    - name: Add NVIDIA PPA
+      apt_repository:
+        repo: "ppa:graphics-drivers/ppa"
+        state: present
+
+    - name: Update APT cache
+      apt:
+        update_cache: yes
+
+    - name: Install NVIDIA driver (version 535)
+      apt:
+        name: "nvidia-driver-535"
+        state: present
+
+    - name: Set flag to indicate reboot is required
+      file:
+        path: /tmp/ansible_reboot_required
+        state: touch
+
+    - name: Reboot if needed after installing NVIDIA drivers
+      reboot:
+        msg: "Rebooting to apply NVIDIA driver"
+        pre_reboot_delay: 5
+        post_reboot_delay: 30
+        test_command: "nvidia-smi"
+
+    - name: Wait for system to come back online
+      wait_for_connection:
+        delay: 30
+        timeout: 600
+
+    - name: Add Kubernetes signing key
+      ansible.builtin.apt_key:
+        keyserver: keyserver.ubuntu.com
+        id: 234654DA9A296436
+        state: present
+
+    - name: Add Kubernetes Repository Key
+      shell: |
+        mkdir -p /etc/apt/keyrings
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.32/deb/Release.key | tee /etc/apt/keyrings/kubernetes-apt-keyring.asc
+
+    - name: Add Kubernetes APT repository
+      copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: |
+          deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v1.32/deb/ /
+
+    - name: Update APT cache
+      apt:
+        update_cache: yes
+
+    - name: Install Kubernetes Components
+      apt:
+        name:
+          - kubeadm
+          - kubelet
+          - kubectl
+        state: present
+
+    - name: Enable and Start containerd
+      systemd:
+        name: containerd
+        enabled: yes
+        state: started
+
+    - name: Enable and Start kubelet
+      systemd:
+        name: kubelet
+        enabled: yes
+        state: started
+
+    - name: Check if container runtime is running
+      shell: "systemctl is-active --quiet containerd"
+      register: containerd_status
+      failed_when: containerd_status.rc != 0
+
+    - name: Initialize Kubernetes (If Not Initialized)
+      command: kubeadm init --pod-network-cidr=192.168.0.0/16
+      args:
+        creates: /etc/kubernetes/admin.conf
+
+    - name: Wait for Kubernetes API Server to become available
+      wait_for:
+        port: 6443
+        host: localhost
+        timeout: 300
+      delegate_to: localhost
+
+    - name: Check Kubernetes API health
+      command: kubectl get --raw='/readyz'
+      register: api_health
+      retries: 5
+      delay: 15
+      until: api_health.stdout.find("ok") != -1
+
+    - name: Deploy Calico Network Plugin
+      shell: kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
+
+    - name: Wait for Calico pods to be ready
+      shell: "kubectl get pods -n kube-system | grep calico | grep Running"
+      register: calico_status
+      retries: 10
+      delay: 15
+      until: "'Running' in calico_status.stdout"
+
+    - name: Verify Kubernetes API Server is Running
+      shell: "ss -tulnp | grep 6443"
+      register: kube_api_status
+      failed_when: kube_api_status.rc != 0
+
+    - name: Comprehensive post-installation checks
+      command: kubectl get all -A
+      register: cluster_health
+      failed_when: cluster_health.rc != 0
+
+    - name: Pause for manual verification before proceeding
+      pause:
+        prompt: "Check if Kubernetes is running properly (kubectl cluster-info). Press Enter to continue to networking setup."
+        minutes: 5
+      when: "'master' in inventory_hostname"
+
+- hosts: all
+  become: yes
+  tasks:
+    - name: Verify NVIDIA GPU Operator installation
+      shell: kubectl get pods -n gpu-operator | grep gpu-operator
+      register: gpu_operator_status
+      failed_when: gpu_operator_status.rc != 0
+
+    - name: Install NVIDIA GPU Operator for Kubernetes GPU Sharing
+      shell: |
+        helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
+        helm repo update
+        helm install gpu-operator nvidia/gpu-operator --namespace gpu-operator --create-namespace
+      when: "'master' in inventory_hostname"
+
+    - name: Configure Kubernetes GPU resource limits for dynamic allocation
+      shell: |
+        kubectl apply -f - <<EOF
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: gpu-test-pod
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: cuda-container
+            image: nvidia/cuda:11.8.0-runtime-ubuntu20.04
+            resources:
+              limits:
+                nvidia.com/gpu: 1  # Full GPU access when available
+        EOF
+      when: "'master' in inventory_hostname"
+
+    - name: Install and configure Kubernetes Web Admin Interface
+      shell: |
+        kubectl apply -f https://raw.githubusercontent.com/kubernetes/dashboard/v2.7.0/aio/deploy/recommended.yaml
+      when: "'master' in inventory_hostname"
+
+    - name: Install monitoring tools (Prometheus & Grafana)
+      shell: |
+        helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+        helm repo update
+        helm install prometheus prometheus-community/kube-prometheus-stack --namespace monitoring --create-namespace
+      when: "'master' in inventory_hostname"
+
+    - name: Verify Prometheus and Grafana are running
+      shell: kubectl get pods -n monitoring | grep -E 'prometheus|grafana'
+      register: monitoring_status
+      failed_when: monitoring_status.rc != 0
+
+    - name: Install Ollama
+      shell: |
+        helm install ollama ./ollama-chart --namespace ollama --create-namespace
+      when: "'master' in inventory_hostname"
+
+    - name: Verify Ollama is running
+      shell: kubectl get pods -n ollama | grep ollama
+      register: ollama_status
+      failed_when: ollama_status.rc != 0
+
+    - name: Install Triton Inference Server
+      shell: |
+        helm install triton ./triton-chart --namespace triton-inference --create-namespace
+      when: "'master' in inventory_hostname"
+
+    - name: Verify Triton Inference Server is running
+      shell: kubectl get pods -n triton-inference | grep triton
+      register: triton_status
+      failed_when: triton_status.rc != 0
+
+    - name: Install OpenWebUI
+      shell: |
+        helm install openwebui ./openwebui-chart --namespace openwebui --create-namespace
+      when: "'master' in inventory_hostname"
+
+    - name: Change OpenWebUI default credentials
+      shell: kubectl exec -n openwebui deploy/openwebui -- ./change_credentials.sh admin admin123 new_password
+      when: "'master' in inventory_hostname"
+
+    - name: Ensure CoreDNS is deployed
+      shell: kubectl get pods -n kube-system | grep coredns || kubectl apply -f https://raw.githubusercontent.com/kubernetes/kubernetes/master/cluster/addons/dns/coredns/coredns.yaml
+      when: "'master' in inventory_hostname"
+
+    - name: Retrieve Kubernetes Dashboard Token
+      shell: kubectl -n kubernetes-dashboard create token admin-user
+      register: k8s_dashboard_token
+      when: "'master' in inventory_hostname"
+
+    - name: Ensure MetalLB is configured
+      shell: |
+        kubectl apply -f - <<EOF
+        apiVersion: metallb.io/v1beta1
+        kind: IPAddressPool
+        metadata:
+          name: default-pool
+          namespace: metallb-system
+        spec:
+          addresses:
+          - 192.168.20.20-192.168.20.24
+        EOF
+
+    - name: Final Kubernetes Cluster Check
+      command: kubectl get nodes
+
+- hosts: k8s_nodes
+  become: yes
+  tasks:
+    - name: Display Deployment Summary
+      debug:
+        msg:
+          - "Kubernetes cluster setup completed successfully."
+          - "Use 'kubectl get nodes' to verify node status."
+          - "Kubernetes Dashboard: https://{{ ansible_host }}:6443"
+          - "Run 'kubectl cluster-info' to check cluster status."
+          - "Kubernetes Dashboard: https://{{ ansible_host }}:6443"
+          - "Kubernetes Dashboard Token: {{ k8s_dashboard_token.stdout }}"
+          - "Prometheus: http://192.168.20.20:9090"
+          - "Grafana: http://192.168.20.21:3000 (User: admin, Password: prom-operator)"
+          - "Triton Inference Server: http://192.168.20.22:8000"
+          - "Ollama: http://192.168.20.23:11434"
+          - "OpenWebUI: http://192.168.20.24:3001 (Default User: admin, Password: admin123)"
+
+

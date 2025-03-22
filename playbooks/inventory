@@ -1,0 +1,11 @@
+[k8s_nodes]
+k8-master ansible_host=192.168.20.10 ansible_user=ee ansible_ssh_private_key_file=/root/.ssh/id_rsa ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+
+[k8s_master]
+k8-master ansible_host=192.168.20.10 ansible_user=ee ansible_ssh_private_key_file=/root/.ssh/id_rsa ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+
+[k8s_nodes:vars]
+ansible_python_interpreter=/usr/bin/python3
+ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+
+

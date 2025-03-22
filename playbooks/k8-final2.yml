@@ -1,0 +1,850 @@
+---
+- hosts: all
+  become: yes
+  vars_files:
+    - common_vars.yml
+  vars:
+    kube_version: "1.32.3-1.1"  # Updated to the version we confirmed working
+    cni_plugin: "calico"
+    cni_version: "v3.26.1"
+    metallb_version: "v0.13.12"
+    metallb_ip_range: "192.168.20.20-192.168.20.24"
+    containerd_config_dir: "/etc/containerd"
+    dashboard_version: "v2.7.0"
+    monitoring_namespace: "monitoring"
+    gpu_operator_namespace: "gpu-operator"
+    ollama_namespace: "ollama"
+    triton_namespace: "triton-inference"
+    openwebui_namespace: "openwebui"
+  tasks:
+    - name: Update and upgrade apt packages
+      apt:
+        update_cache: yes
+        upgrade: yes
+        cache_valid_time: 3600
+
+    - name: Install essential system packages
+      apt:
+        name:
+          - curl
+          - git
+          - build-essential
+          - nfs-common
+          - ca-certificates
+          - apt-transport-https
+          - gnupg
+          - software-properties-common
+          - containerd
+          - htop
+          - unzip
+          - net-tools
+        state: present
+
+    - name: Ensure NTP is installed and running
+      apt:
+        name: ntp
+        state: present
+      notify: Restart NTP
+
+    - name: Ensure swap is disabled permanently
+      replace:
+        path: /etc/fstab
+        regexp: '^(.*\sswap\s.*)$'
+        replace: '#\1'
+        backup: yes
+
+    - name: Disable swap immediately
+      command: swapoff -a
+      changed_when: false  # Prevent task from always reporting as changed
+
+    # Ensure bridge module is loaded before setting bridge-nf-call parameters
+    - name: Load bridge module
+      modprobe:
+        name: bridge
+        state: present
+      ignore_errors: true
+
+    - name: Add bridge module to /etc/modules to load at boot
+      lineinfile:
+        path: /etc/modules
+        line: bridge
+        create: yes
+        state: present
+
+    # Configure containerd properly
+    - name: Create containerd config directory
+      file:
+        path: "{{ containerd_config_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Configure containerd to use systemd cgroup driver
+      copy:
+        dest: "{{ containerd_config_dir }}/config.toml"
+        content: |
+          version = 2
+          [plugins]
+            [plugins."io.containerd.grpc.v1.cri"]
+              [plugins."io.containerd.grpc.v1.cri".containerd]
+                snapshotter = "overlayfs"
+                [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+                  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+                    runtime_type = "io.containerd.runc.v2"
+                    [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+                      SystemdCgroup = true
+
+    - name: Enable IP forwarding for Kubernetes networking
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        state: present
+        sysctl_set: yes
+        reload: yes
+
+    # Modified approach for bridge network configuration
+    - name: Add bridge network configuration
+      sysctl:
+        name: "{{ item }}"
+        value: '1'
+        state: present
+        sysctl_set: yes
+        reload: yes
+        ignoreerrors: yes  # Prevent task from failing if module isn't loaded yet
+      with_items:
+        - net.bridge.bridge-nf-call-iptables
+        - net.bridge.bridge-nf-call-ip6tables
+      register: sysctl_result
+      failed_when: 
+        - sysctl_result.failed is defined and sysctl_result.failed
+        - "'No such file or directory' not in sysctl_result.msg | default('')"
+
+    - name: Alternative bridge network configuration
+      shell: "echo 1 > /proc/sys/net/bridge/{{ item }} || true"
+      with_items:
+        - bridge-nf-call-iptables
+        - bridge-nf-call-ip6tables
+      when: sysctl_result.failed is defined and sysctl_result.failed
+      changed_when: false
+
+    - name: Create necessary model directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /models/triton/model_repo
+        - /models/ollama
+
+  handlers:
+    - name: Restart NTP
+      service:
+        name: ntp
+        state: restarted
+        enabled: yes
+
+- hosts: all
+  become: yes
+  vars:
+    kube_version: "1.32.3-1.1"  # Redefine in each play for safety
+  tasks:
+    - name: Install Helm
+      shell: |
+        curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      args:
+        creates: /usr/local/bin/helm
+      register: helm_install
+      changed_when: helm_install.rc == 0
+
+    # --- NVIDIA PPA and Driver Section ---
+    - name: Update APT cache
+      apt:
+        update_cache: yes
+
+    - name: Install NVIDIA driver (version 535)
+      apt:
+        name: "nvidia-driver-535"
+        state: present
+      register: nvidia_driver_install
+
+    - name: Set flag to indicate reboot is required
+      command: nvidia-smi
+      register: nvidia_smi_check
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Create reboot flag if NVIDIA driver is not active
+      file:
+        path: /tmp/ansible_reboot_required
+        state: touch
+      when: nvidia_smi_check.rc != 0
+
+    - name: Reboot if needed after installing NVIDIA drivers
+      reboot:
+        msg: "Rebooting to apply NVIDIA driver"
+        pre_reboot_delay: 5
+        post_reboot_delay: 30
+        test_command: "nvidia-smi"
+      when: nvidia_smi_check.rc != 0
+
+    - name: Wait for system to come back online
+      wait_for_connection:
+        delay: 30
+        timeout: 600
+      when: nvidia_smi_check.rc != 0
+
+- hosts: all
+  become: yes
+  vars:
+    kube_version: "1.32.3-1.1"  # Redefine in each play
+    cni_plugin: "calico"
+    cni_version: "v3.26.1"
+    metallb_version: "v0.13.12"
+    metallb_ip_range: "192.168.20.20-192.168.20.24"
+    containerd_config_dir: "/etc/containerd"
+  tasks:
+    - name: Ensure /etc/apt/keyrings directory exists
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Download and dearmor Kubernetes APT repository GPG key
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.32/deb/Release.key | gpg --dearmor | tee /etc/apt/keyrings/kubernetes-archive-keyring.gpg > /dev/null
+      args:
+        creates: /etc/apt/keyrings/kubernetes-archive-keyring.gpg
+      register: k8s_key_download
+      changed_when: k8s_key_download.rc == 0
+
+    - name: Add Kubernetes APT repository
+      copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: |
+          deb [signed-by=/etc/apt/keyrings/kubernetes-archive-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.32/deb/ /
+        mode: '0644'
+
+    - name: Update APT cache
+      apt:
+        update_cache: yes
+
+    - name: Install Kubernetes Components
+      apt:
+        name:
+          - "kubeadm={{ kube_version }}"
+          - "kubelet={{ kube_version }}"
+          - "kubectl={{ kube_version }}"
+        state: present
+        allow_downgrade: yes
+      register: k8s_installed
+
+    # Restart and configure containerd properly
+    - name: Restart containerd with new configuration
+      systemd:
+        name: containerd
+        state: restarted
+        daemon_reload: yes
+        enabled: yes
+
+    # Make sure kubelet has proper configuration
+    - name: Create kubelet systemd dropin directory
+      file:
+        path: /etc/systemd/system/kubelet.service.d
+        state: directory
+        mode: '0755'
+
+    - name: Configure kubelet service
+      copy:
+        dest: /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+        content: |
+          [Service]
+          Environment="KUBELET_KUBECONFIG_ARGS=--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
+          Environment="KUBELET_CONFIG_ARGS=--config=/var/lib/kubelet/config.yaml"
+          Environment="KUBELET_EXTRA_ARGS=--container-runtime-endpoint=unix:///run/containerd/containerd.sock --cgroup-driver=systemd"
+          # This is a file that "kubeadm init" and "kubeadm join" generate at runtime, populating the KUBELET_KUBEADM_ARGS variable dynamically
+          EnvironmentFile=-/var/lib/kubelet/kubeadm-flags.env
+          # This is a file that the user can use for overrides of the kubelet args as a last resort. Preferably, use the .NodeRegistration.KubeletExtraArgs object in the configuration files instead
+          EnvironmentFile=-/etc/default/kubelet
+          ExecStart=
+          ExecStart=/usr/bin/kubelet $KUBELET_KUBECONFIG_ARGS $KUBELET_CONFIG_ARGS $KUBELET_KUBEADM_ARGS $KUBELET_EXTRA_ARGS
+        mode: '0644'
+
+    - name: Enable and Start kubelet
+      systemd:
+        name: kubelet
+        state: started
+        daemon_reload: yes
+        enabled: yes
+
+    - name: Check if container runtime is running
+      shell: "systemctl is-active containerd"
+      register: containerd_status
+      changed_when: false
+      failed_when: containerd_status.stdout != "active"
+
+    # --- Cleanup Tasks to Remove Leftovers ---
+    - name: Clean up previous Kubernetes manifest files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/kubernetes/manifests/kube-apiserver.yaml
+        - /etc/kubernetes/manifests/kube-controller-manager.yaml
+        - /etc/kubernetes/manifests/kube-scheduler.yaml
+        - /etc/kubernetes/manifests/etcd.yaml
+      when: "'k8s_master' in group_names"
+
+    - name: Clean up previous etcd data directory
+      file:
+        path: /var/lib/etcd
+        state: absent
+      when: "'k8s_master' in group_names"
+
+    - name: Reset previous Kubernetes cluster
+      command: kubeadm reset -f
+      when: "'k8s_master' in group_names"
+      register: kubeadm_reset
+      changed_when: kubeadm_reset.rc == 0
+      failed_when: false  # Don't fail if there was no cluster to reset
+
+    - name: Remove leftover admin.conf if exists
+      file:
+        path: /etc/kubernetes/admin.conf
+        state: absent
+      when: "'k8s_master' in group_names"
+    # --- End Cleanup Tasks ---
+
+    - name: Initialize Kubernetes with specific configuration
+      shell: |
+        kubeadm init \
+          --pod-network-cidr=192.168.0.0/16 \
+          --apiserver-advertise-address={{ ansible_host }} \
+          --v=5
+      register: kubeadm_init
+      failed_when: kubeadm_init.rc != 0
+      changed_when: kubeadm_init.rc == 0
+      when: "'k8s_master' in group_names"
+
+    # Ensure proper permissions for kubeconfig
+    - name: Create .kube directory
+      file:
+        path: "/root/.kube"
+        state: directory
+        mode: '0755'
+      when: "'k8s_master' in group_names"
+
+    - name: Copy kubeconfig to root user
+      shell: |
+        cp -f /etc/kubernetes/admin.conf /root/.kube/config
+        chown $(id -u):$(id -g) /root/.kube/config
+      when: "'k8s_master' in group_names"
+
+    # More robust API server availability checking
+    - name: Wait for Kubernetes API Server to become available on Master
+      wait_for:
+        host: "{{ ansible_host }}"
+        port: 6443
+        timeout: 600
+      delegate_to: localhost
+      when: "'k8s_master' in group_names"
+
+    # Add retry logic for API server
+    - name: Wait for Kubernetes API server to stabilize
+      shell: "systemctl status kubelet"
+      register: kubelet_status
+      retries: 10
+      delay: 20
+      until: "'active (running)' in kubelet_status.stdout"
+      when: "'k8s_master' in group_names"
+      changed_when: false
+
+    - name: Check Kubernetes API health
+      shell: curl -k https://{{ ansible_host }}:6443/healthz
+      register: api_health
+      retries: 10
+      delay: 20
+      until: "'ok' in api_health.stdout"
+      when: "'k8s_master' in group_names"
+      changed_when: false
+
+    - name: Debug kubectl check results
+      debug:
+        var: kubectl_check.stdout_lines
+      when: "'k8s_master' in group_names"
+
+    - name: Deploy Calico with version pinning for stability
+      shell: |
+        /usr/local/bin/kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/{{ cni_version }}/manifests/calico.yaml --validate=false
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: "'k8s_master' in group_names"
+      register: calico_deploy
+      changed_when: calico_deploy.rc == 0
+
+    - name: Wait for Calico pods to be ready
+      shell: "/usr/local/bin/kubectl -n kube-system get pods -l k8s-app=calico-node -o jsonpath='{.items[*].status.phase}' | grep -v Running | wc -l"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: calico_pods
+      retries: 15
+      delay: 20
+      until: calico_pods.stdout | int == 0
+      when: "'k8s_master' in group_names"
+      changed_when: false
+
+    - name: Verify Kubernetes API Server is Running
+      shell: "netstat -tlpn | grep 6443"
+      register: kube_api_status
+      retries: 5
+      delay: 10
+      until: kube_api_status.rc == 0
+      when: "'k8s_master' in group_names"
+      changed_when: false
+
+    - name: Verify Kubernetes Cluster is Ready
+      command: /usr/local/bin/kubectl get nodes
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: nodes_status
+      retries: 5
+      delay: 10
+      until: "'NotReady' not in nodes_status.stdout"
+      when: "'k8s_master' in group_names"
+      changed_when: false
+
+    - name: Verify All System Pods are Running
+      shell: |
+        TOTAL_PODS=$(/usr/local/bin/kubectl get pods -n kube-system --no-headers | wc -l)
+        RUNNING_PODS=$(/usr/local/bin/kubectl get pods -n kube-system --no-headers | grep -w "Running" | wc -l)
+        if [ "$TOTAL_PODS" -eq "$RUNNING_PODS" ]; then
+          echo "0"
+        else
+          echo "1"
+        fi
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: system_pods
+      retries: 15
+      delay: 60
+      until: system_pods.stdout | int == 0
+      when: "'k8s_master' in group_names"
+      changed_when: false
+
+    # Better kubeconfig handling
+    - name: Set KUBECONFIG environment variable globally
+      copy:
+        dest: /etc/profile.d/kubectl.sh
+        content: 'export KUBECONFIG=/etc/kubernetes/admin.conf'
+        mode: '0755'
+
+    - name: Ensure /root/.kube directory exists
+      file:
+        path: /root/.kube
+        state: directory
+        mode: '0700'
+      when: "'k8s_master' in group_names"
+
+    # Fix permissions properly
+    - name: Fix permissions on /etc/kubernetes/admin.conf
+      file:
+        path: /etc/kubernetes/admin.conf
+        owner: root
+        group: root
+        mode: '0644'
+      when: "'k8s_master' in group_names"
+
+    - name: Copy kubeconfig to default location
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        remote_src: yes
+        mode: '0600'
+      when: "'k8s_master' in group_names"
+
+    # Additional fix for user access
+    - name: Create a regular user .kube directory
+      file:
+        path: "/home/{{ ansible_user }}/.kube"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0700'
+      when: "'k8s_master' in group_names"
+
+    - name: Copy kubeconfig for regular user
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "/home/{{ ansible_user }}/.kube/config"
+        remote_src: yes
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0600'
+      when: "'k8s_master' in group_names"
+
+    - name: Set dashboard variables
+      set_fact:
+        dashboard_version: "v2.7.0"
+        metallb_version: "v0.13.12"
+        metallb_ip_range: "192.168.20.20-192.168.20.24"
+        monitoring_namespace: "monitoring"
+        gpu_operator_namespace: "gpu-operator"
+        ollama_namespace: "ollama"
+        triton_namespace: "triton-inference"
+        openwebui_namespace: "openwebui"
+      when: "'k8s_master' in group_names"
+
+    - name: Install and configure Kubernetes Web Admin Interface
+      shell: |
+        /usr/local/bin/kubectl apply -f https://raw.githubusercontent.com/kubernetes/dashboard/{{ dashboard_version }}/aio/deploy/recommended.yaml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: "'k8s_master' in group_names"
+      register: dashboard_install
+      changed_when: dashboard_install.rc == 0
+
+    # Add tolerations to allow dashboard pods to run on control-plane/master nodes
+    - name: Add tolerations to Kubernetes Dashboard deployment
+      shell: |
+        /usr/local/bin/kubectl patch deployment kubernetes-dashboard -n kubernetes-dashboard --patch '{
+          "spec": {
+            "template": {
+              "spec": {
+                "tolerations": [
+                  {
+                    "key": "node-role.kubernetes.io/control-plane",
+                    "operator": "Exists",
+                    "effect": "NoSchedule"
+                  },
+                  {
+                    "key": "node-role.kubernetes.io/master",
+                    "operator": "Exists",
+                    "effect": "NoSchedule"
+                  }
+                ]
+              }
+            }
+          }
+        }'
+      args:
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: "'k8s_master' in group_names"
+      register: dashboard_patch
+      changed_when: dashboard_patch.rc == 0
+
+    - name: Verify Kubernetes Dashboard pod is running
+      shell: "/usr/local/bin/kubectl get pods -n kubernetes-dashboard -l k8s-app=kubernetes-dashboard -o jsonpath='{.items[*].status.phase}'"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: dashboard_status
+      retries: 15
+      delay: 20
+      until: "'Running' in dashboard_status.stdout"
+      when: "'k8s_master' in group_names"
+      changed_when: false
+
+    - name: Check kubectl location and version
+      shell: |
+        which kubectl || echo "kubectl not found in PATH"
+        find / -name kubectl 2>/dev/null || echo "kubectl binary not found on system"
+        ls -la /usr/bin/kubectl || echo "kubectl not in /usr/bin"
+        ls -la /usr/local/bin/kubectl || echo "kubectl not in /usr/local/bin"
+      register: kubectl_check
+      when: "'k8s_master' in group_names"
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Debug kubectl check results
+      debug:
+        var: kubectl_check.stdout_lines
+      when: "'k8s_master' in group_names"
+
+    - name: Direct installation of kubectl and MetalLB
+      shell: |
+        # Direct kubectl installation
+        echo "Downloading and installing kubectl..."
+        cd /tmp
+        curl -LO "https://dl.k8s.io/release/v1.29.0/bin/linux/amd64/kubectl"
+        chmod +x kubectl
+        cp kubectl /usr/local/bin/kubectl
+        
+        # Verify kubectl
+        echo "Verifying kubectl installation..."
+        /usr/local/bin/kubectl version --client || exit 1
+        
+        # Install MetalLB
+        echo "Installing MetalLB..."
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        /usr/local/bin/kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/{{ metallb_version }}/config/manifests/metallb-native.yaml
+        sleep 30
+        
+        # Wait for MetalLB pods to be ready
+        echo "Waiting for MetalLB pods to be ready..."
+        /usr/local/bin/kubectl wait --namespace metallb-system --for=condition=ready pod --selector=app=metallb --timeout=300s
+        
+        # Configure MetalLB IP pool
+        echo "Configuring MetalLB IP pool..."
+        cat <<EOF | /usr/local/bin/kubectl apply -f -
+        apiVersion: metallb.io/v1beta1
+        kind: IPAddressPool
+        metadata:
+          name: default-pool
+          namespace: metallb-system
+        spec:
+          addresses:
+          - {{ metallb_ip_range }}
+        ---
+        apiVersion: metallb.io/v1beta1
+        kind: L2Advertisement
+        metadata:
+          name: l2-advert
+          namespace: metallb-system
+        spec:
+          ipAddressPools:
+          - default-pool
+        EOF
+      args:
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: "'k8s_master' in group_names"
+      register: metallb_direct
+      changed_when: metallb_direct.rc == 0
+      
+    - name: Install monitoring tools (Prometheus & Grafana)
+      shell: |
+        helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+        helm repo update
+        kubectl create namespace {{ monitoring_namespace }} --dry-run=client -o yaml | kubectl apply -f -
+        helm install prometheus prometheus-community/kube-prometheus-stack --namespace {{ monitoring_namespace }} --wait --timeout 10m
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: monitoring_install
+      retries: 2
+      delay: 60
+      until: monitoring_install.rc == 0
+      when: "'k8s_master' in group_names"
+      changed_when: monitoring_install.rc == 0
+
+    - name: Verify Prometheus/Grafana pods are running
+      shell: "kubectl get pods -n {{ monitoring_namespace }} | grep -c Running"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: monitoring_status
+      retries: 20
+      delay: 20
+      until: monitoring_status.stdout | int > 0
+      when: "'k8s_master' in group_names"
+      changed_when: false
+
+    - name: Ensure CoreDNS is deployed
+      shell: |
+        set -e
+        COREDNS_PODS=$(kubectl -n kube-system get pods -l k8s-app=kube-dns 2>/dev/null | grep -v "No resources found" | wc -l)
+        if [ "$COREDNS_PODS" -eq 0 ]; then
+          kubectl apply -f https://raw.githubusercontent.com/coredns/deployment/master/kubernetes/coredns.yaml
+        fi
+      args:
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: "'k8s_master' in group_names"
+      register: coredns_deploy
+      changed_when: "'configured' in coredns_deploy.stdout"
+
+    - name: Verify chart directories exist before installation
+      stat:
+        path: "./{{ item }}-chart"
+      register: chart_dirs
+      with_items:
+        - ollama
+        - triton
+        - openwebui
+      when: "'k8s_master' in group_names"
+
+    - name: Install Ollama
+      shell: |
+        helm install ollama ./ollama-chart --namespace {{ ollama_namespace }} --create-namespace --timeout 10m
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: "'k8s_master' in group_names and chart_dirs.results[0].stat.exists"
+      ignore_errors: yes
+      register: ollama_install
+      changed_when: ollama_install.rc == 0
+
+    - name: Verify Ollama pod is running
+      shell: "kubectl -n {{ ollama_namespace }} get pods -o wide"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: ollama_status
+      retries: 15
+      delay: 20
+      until: "'Running' in ollama_status.stdout"
+      when: "'k8s_master' in group_names and chart_dirs.results[0].stat.exists"
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Install Triton Inference Server
+      shell: |
+        helm install triton ./triton-chart --namespace {{ triton_namespace }} --create-namespace --timeout 10m
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: "'k8s_master' in group_names and chart_dirs.results[1].stat.exists"
+      ignore_errors: yes
+      register: triton_install
+      changed_when: triton_install.rc == 0
+
+    - name: Verify Triton Inference Server pod is running
+      shell: "kubectl -n {{ triton_namespace }} get pods -o wide"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: triton_status
+      retries: 15
+      delay: 20
+      until: "'Running' in triton_status.stdout"
+      when: "'k8s_master' in group_names and chart_dirs.results[1].stat.exists"
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Install OpenWebUI
+      shell: |
+        helm install openwebui ./openwebui-chart --namespace {{ openwebui_namespace }} --create-namespace --timeout 10m
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: "'k8s_master' in group_names and chart_dirs.results[2].stat.exists"
+      ignore_errors: yes
+      register: openwebui_install
+      changed_when: openwebui_install.rc == 0
+
+    - name: Verify OpenWebUI pod is running
+      shell: "kubectl -n {{ openwebui_namespace }} get pods -o wide"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: openwebui_status
+      retries: 15
+      delay: 20
+      until: "'Running' in openwebui_status.stdout"
+      when: "'k8s_master' in group_names and chart_dirs.results[2].stat.exists"
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Retrieve Kubernetes Dashboard Token
+      shell: kubectl -n kubernetes-dashboard create token admin-user
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: k8s_dashboard_token
+      when: "'k8s_master' in group_names"
+      changed_when: false
+
+    - name: Final Kubernetes Cluster Check
+      command: kubectl get nodes
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      changed_when: false
+
+- hosts: all
+  become: yes
+  vars:
+    kube_version: "1.32.3-1.1"  # Redefine in each play
+    dashboard_version: "v2.7.0"
+    metallb_version: "v0.13.12"
+    metallb_ip_range: "192.168.20.20-192.168.20.24"
+    monitoring_namespace: "monitoring"
+    gpu_operator_namespace: "gpu-operator"
+    ollama_namespace: "ollama"
+    triton_namespace: "triton-inference"
+    openwebui_namespace: "openwebui"
+  tasks:
+    - name: Install NVIDIA GPU Operator for Kubernetes GPU Sharing
+      shell: |
+        helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
+        helm repo update
+        kubectl create namespace {{ gpu_operator_namespace }} --dry-run=client -o yaml | kubectl apply -f -
+        helm install gpu-operator nvidia/gpu-operator --namespace {{ gpu_operator_namespace }} --wait --timeout 10m
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: gpu_operator_install
+      retries: 2
+      delay: 60
+      until: gpu_operator_install.rc == 0
+      when: "'k8s_master' in group_names"
+      ignore_errors: yes
+      changed_when: gpu_operator_install.rc == 0
+
+    - name: Verify NVIDIA GPU Operator pod is running
+      shell: "kubectl get pods -n {{ gpu_operator_namespace }} -l app.kubernetes.io/name=gpu-operator -o jsonpath='{.items[*].status.phase}'"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: gpu_operator_status
+      retries: 10
+      delay: 30
+      until: "'Running' in gpu_operator_status.stdout"
+      when: "'k8s_master' in group_names"
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Configure Kubernetes GPU resource limits for dynamic allocation
+      shell: |
+        cat <<EOF | kubectl apply -f -
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: gpu-test-pod
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: cuda-container
+            image: nvidia/cuda:11.8.0-runtime-ubuntu20.04
+            command: ["nvidia-smi"]
+            resources:
+              limits:
+                nvidia.com/gpu: 1
+        EOF
+      args:
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: "'k8s_master' in group_names"
+      ignore_errors: yes
+      register: gpu_test_pod_create
+      changed_when: gpu_test_pod_create.rc == 0
+
+    - name: Wait for GPU test pod to initialize
+      shell: "kubectl -n kube-system get pods gpu-test-pod -o jsonpath='{.status.phase}'"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: gpu_test_init
+      retries: 10
+      delay: 15
+      until: gpu_test_init.rc == 0
+      when: "'k8s_master' in group_names"
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Verify GPU test pod is running or completed
+      shell: "kubectl -n kube-system get pods gpu-test-pod -o jsonpath='{.status.phase}'"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: gpu_test_status
+      retries: 15
+      delay: 20
+      until: "'Running' in gpu_test_status.stdout or 'Completed' in gpu_test_status.stdout or 'Succeeded' in gpu_test_status.stdout"
+      when: "'k8s_master' in group_names"
+      ignore_errors: yes
+      changed_when: false
+
+- hosts: k8s_nodes
+  become: yes
+  vars:
+    metallb_ip_range: "192.168.20.20-192.168.20.24"
+  tasks:
+    - name: Display Deployment Summary
+      debug:
+        msg:
+          - "Kubernetes cluster setup completed successfully."
+          - "Use 'kubectl get nodes' to verify node status."
+          - "Kubernetes Dashboard: https://{{ ansible_host }}:6443"
+          - "Run 'kubectl cluster-info' to check cluster status."
+          - "Kubernetes Dashboard Token: {{ hostvars['k8-master'].k8s_dashboard_token.stdout | default('Token not available') }}"
+          - "Prometheus: http://192.168.20.20:9090"
+          - "Grafana: http://192.168.20.20:3000"
