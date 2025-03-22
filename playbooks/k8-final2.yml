@@ -756,31 +756,74 @@
     openwebui_namespace: "openwebui"
   tasks:
     - name: Install NVIDIA GPU Operator for Kubernetes GPU Sharing
-      shell: |
-        helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
-        helm repo update
-        kubectl create namespace {{ gpu_operator_namespace }} --dry-run=client -o yaml | kubectl apply -f -
-        helm install gpu-operator nvidia/gpu-operator --namespace {{ gpu_operator_namespace }} --wait --timeout 10m
-      environment:
-        KUBECONFIG: /etc/kubernetes/admin.conf
-      register: gpu_operator_install
-      retries: 2
-      delay: 60
-      until: gpu_operator_install.rc == 0
+      block:
+        - name: Check if NVIDIA drivers are installed and working
+          command: nvidia-smi
+          register: nvidia_smi_result
+          changed_when: false
+          failed_when: false
+          
+        - name: Verify NVIDIA driver is working
+          assert:
+            that: nvidia_smi_result.rc == 0
+            fail_msg: "NVIDIA drivers are not working properly. GPU Operator requires functioning NVIDIA drivers."
+          
+        - name: Add NVIDIA Helm repository
+          shell: |
+            helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
+            helm repo update
+          environment:
+            KUBECONFIG: /etc/kubernetes/admin.conf
+          register: helm_repo_add
+          changed_when: helm_repo_add.rc == 0
+          
+        - name: Create GPU Operator namespace
+          shell: |
+            kubectl create namespace {{ gpu_operator_namespace }} --dry-run=client -o yaml | kubectl apply -f -
+          environment:
+            KUBECONFIG: /etc/kubernetes/admin.conf
+          register: namespace_create
+          changed_when: namespace_create.rc == 0
+          
+        - name: Install NVIDIA GPU Operator with custom values
+          shell: |
+            helm install gpu-operator nvidia/gpu-operator \
+              --namespace {{ gpu_operator_namespace }} \
+              --set driver.enabled=false \
+              --set toolkit.enabled=true \
+              --set devicePlugin.enabled=true \
+              --set mig.enabled=true \
+              --set validator.enabled=true \
+              --wait --timeout 15m
+          environment:
+            KUBECONFIG: /etc/kubernetes/admin.conf
+          register: gpu_operator_install
+          retries: 2
+          delay: 60
+          until: gpu_operator_install.rc == 0
+          
       when: "'k8s_master' in group_names"
-      ignore_errors: yes
-      changed_when: gpu_operator_install.rc == 0
-
-    - name: Verify NVIDIA GPU Operator pod is running
-      shell: "kubectl get pods -n {{ gpu_operator_namespace }} -l app.kubernetes.io/name=gpu-operator -o jsonpath='{.items[*].status.phase}'"
+      
+    - name: Wait for GPU operator pods to be created
+      shell: "kubectl get pods -n {{ gpu_operator_namespace }} -o name | wc -l"
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
-      register: gpu_operator_status
-      retries: 10
+      register: gpu_pods_count
+      retries: 15
+      delay: 20
+      until: gpu_pods_count.stdout | int > 0
+      when: "'k8s_master' in group_names"
+      changed_when: false
+      
+    - name: Verify NVIDIA GPU Operator pods are running
+      shell: "kubectl get pods -n {{ gpu_operator_namespace }} -o jsonpath='{range .items[*]}{.status.phase}\\n{end}' | grep -v Running | wc -l"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: gpu_pods_not_running
+      retries: 20
       delay: 30
-      until: "'Running' in gpu_operator_status.stdout"
-      when: "'k8s_master' in group_names"
-      ignore_errors: yes
+      until: gpu_pods_not_running.stdout | int == 0
+      when: "'k8s_master' in group_names and gpu_pods_count.stdout | int > 0" 
       changed_when: false
 
     - name: Configure Kubernetes GPU resource limits for dynamic allocation
@@ -805,7 +848,6 @@
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
       when: "'k8s_master' in group_names"
-      ignore_errors: yes
       register: gpu_test_pod_create
       changed_when: gpu_test_pod_create.rc == 0
 
@@ -818,7 +860,6 @@
       delay: 15
       until: gpu_test_init.rc == 0
       when: "'k8s_master' in group_names"
-      ignore_errors: yes
       changed_when: false
 
     - name: Verify GPU test pod is running or completed
@@ -830,7 +871,6 @@
       delay: 20
       until: "'Running' in gpu_test_status.stdout or 'Completed' in gpu_test_status.stdout or 'Succeeded' in gpu_test_status.stdout"
       when: "'k8s_master' in group_names"
-      ignore_errors: yes
       changed_when: false
 
 - hosts: k8s_nodes
