@@ -770,7 +770,7 @@
                   - containerPort: 3000
                   env:
                   - name: OLLAMA_API_BASE_URL
-                    value: "http://ollama.{{ ollama_namespace }}.svc.cluster.local:11434"
+                    value: "http://ollama-service.{{ ollama_namespace }}.svc.cluster.local:11434"
                   - name: HOST
                     value: "0.0.0.0"
                   - name: PORT
