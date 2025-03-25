@@ -714,34 +714,33 @@
       when: "'k8s_master' in group_names and (chart_dirs.results[2] is not defined or not chart_dirs.results[2].stat.exists)"
       register: create_openwebui_chart
 
-    - name: Download OpenWebUI Helm chart values
-      get_url:
-        url: https://raw.githubusercontent.com/open-webui/open-webui/main/kubernetes/values.yaml
-        dest: "./openwebui-chart/values.yaml"
-        mode: '0644'
-      when: "'k8s_master' in group_names and (create_openwebui_chart.changed or (chart_dirs.results[2] is defined and chart_dirs.results[2].stat.exists and not lookup('file', './openwebui-chart/values.yaml', errors='ignore')))"
-      register: download_values
+    - name: Create OpenWebUI namespace
+      shell: kubectl create namespace {{ openwebui_namespace }} || true
+      ignore_errors: yes
+      when: "'k8s_master' in group_names"
 
-    - name: Create OpenWebUI Chart.yaml
-      copy:
-        dest: "./openwebui-chart/Chart.yaml"
-        content: |
-          apiVersion: v2
-          name: openwebui
-          description: Helm chart for Open WebUI
-          type: application
-          version: 0.1.0
-          appVersion: "latest"
-      when: "'k8s_master' in group_names and (create_openwebui_chart.changed or (chart_dirs.results[2] is defined and chart_dirs.results[2].stat.exists and not lookup('file', './openwebui-chart/Chart.yaml', errors='ignore')))"
-      register: create_chart_yaml
-
-    - name: Create OpenWebUI templates directory
+    - name: Create OpenWebUI chart directory
       file:
         path: "./openwebui-chart/templates"
         state: directory
         mode: '0755'
-      when: "'k8s_master' in group_names and (create_openwebui_chart.changed or (chart_dirs.results[2] is defined and chart_dirs.results[2].stat.exists and not lookup('file', './openwebui-chart/templates', errors='ignore')))"
-      register: create_templates_dir
+      when: "'k8s_master' in group_names"
+
+    - name: Create OpenWebUI configmap.yaml
+      copy:
+        dest: "./openwebui-chart/templates/configmap.yaml"
+        content: |
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: openwebui-config
+            namespace: {{ openwebui_namespace }}
+          data:
+            .env: |
+              OLLAMA_API_BASE_URL=http://ollama-service.{{ ollama_namespace }}.svc.cluster.local:11434
+              HOST=0.0.0.0
+              PORT=3000
+      when: "'k8s_master' in group_names"
 
     - name: Create OpenWebUI deployment.yaml
       copy:
@@ -768,20 +767,20 @@
                   imagePullPolicy: Always
                   ports:
                   - containerPort: 3000
-                  env:
-                  - name: OLLAMA_API_BASE_URL
-                    value: "http://ollama-service.{{ ollama_namespace }}.svc.cluster.local:11434"
-                  - name: HOST
-                    value: "0.0.0.0"
-                  - name: PORT
-                    value: "3000"
+                  volumeMounts:
+                  - name: config-volume
+                    mountPath: /app/.env
+                    subPath: .env
                   resources:
                     limits:
                       memory: "2Gi"
                     requests:
                       memory: "1Gi"
-      when: "'k8s_master' in group_names and (create_templates_dir.changed or (chart_dirs.results[2] is defined and chart_dirs.results[2].stat.exists and not lookup('file', './openwebui-chart/templates/deployment.yaml', errors='ignore')))"
-      register: create_deployment
+                volumes:
+                - name: config-volume
+                  configMap:
+                    name: openwebui-config
+      when: "'k8s_master' in group_names"
 
     - name: Create OpenWebUI service.yaml
       copy:
@@ -799,19 +798,10 @@
             - port: 3001
               targetPort: 3000
             type: LoadBalancer
-      when: "'k8s_master' in group_names and (create_templates_dir.changed or (chart_dirs.results[2] is defined and chart_dirs.results[2].stat.exists and not lookup('file', './openwebui-chart/templates/service.yaml', errors='ignore')))"
-      register: create_service
+      when: "'k8s_master' in group_names"
 
     - name: Install OpenWebUI
       block:
-        - name: Create OpenWebUI namespace
-          shell: |
-            kubectl create namespace {{ openwebui_namespace }} --dry-run=client -o yaml | kubectl apply -f -
-          environment:
-            KUBECONFIG: /etc/kubernetes/admin.conf
-          register: namespace_create
-          changed_when: namespace_create.rc == 0
-          
         - name: Install OpenWebUI using Helm
           shell: |
             helm install openwebui ./openwebui-chart --namespace {{ openwebui_namespace }} --timeout 10m
