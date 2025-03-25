@@ -652,7 +652,7 @@
       register: coredns_deploy
       changed_when: "'configured' in coredns_deploy.stdout"
 
-    - name: Verify chart directories exist before installation
+    - name: Check if chart directories exist
       stat:
         path: "./{{ item }}-chart"
       register: chart_dirs
@@ -662,70 +662,139 @@
         - openwebui
       when: "'k8s_master' in group_names"
 
-    - name: Install Ollama
-      shell: |
-        helm install ollama ./ollama-chart --namespace {{ ollama_namespace }} --create-namespace --timeout 10m
-      environment:
-        KUBECONFIG: /etc/kubernetes/admin.conf
-      when: "'k8s_master' in group_names and chart_dirs.results[0].stat.exists"
-      ignore_errors: yes
-      register: ollama_install
-      changed_when: ollama_install.rc == 0
+    - name: Create OpenWebUI chart directory if it doesn't exist
+      file:
+        path: "./openwebui-chart"
+        state: directory
+        mode: '0755'
+      when: "'k8s_master' in group_names and (chart_dirs.results[2] is not defined or not chart_dirs.results[2].stat.exists)"
+      register: create_openwebui_chart
 
-    - name: Verify Ollama pod is running
-      shell: "kubectl -n {{ ollama_namespace }} get pods -o wide"
-      environment:
-        KUBECONFIG: /etc/kubernetes/admin.conf
-      register: ollama_status
-      retries: 15
-      delay: 20
-      until: "'Running' in ollama_status.stdout"
-      when: "'k8s_master' in group_names and chart_dirs.results[0].stat.exists"
-      ignore_errors: yes
-      changed_when: false
+    - name: Download OpenWebUI Helm chart values
+      get_url:
+        url: https://raw.githubusercontent.com/open-webui/open-webui/main/kubernetes/values.yaml
+        dest: "./openwebui-chart/values.yaml"
+        mode: '0644'
+      when: "'k8s_master' in group_names and (create_openwebui_chart.changed or (chart_dirs.results[2] is defined and chart_dirs.results[2].stat.exists and not lookup('file', './openwebui-chart/values.yaml', errors='ignore')))"
+      register: download_values
 
-    - name: Install Triton Inference Server
-      shell: |
-        helm install triton ./triton-chart --namespace {{ triton_namespace }} --create-namespace --timeout 10m
-      environment:
-        KUBECONFIG: /etc/kubernetes/admin.conf
-      when: "'k8s_master' in group_names and chart_dirs.results[1].stat.exists"
-      ignore_errors: yes
-      register: triton_install
-      changed_when: triton_install.rc == 0
+    - name: Create OpenWebUI Chart.yaml
+      copy:
+        dest: "./openwebui-chart/Chart.yaml"
+        content: |
+          apiVersion: v2
+          name: openwebui
+          description: Helm chart for Open WebUI
+          type: application
+          version: 0.1.0
+          appVersion: "latest"
+      when: "'k8s_master' in group_names and (create_openwebui_chart.changed or (chart_dirs.results[2] is defined and chart_dirs.results[2].stat.exists and not lookup('file', './openwebui-chart/Chart.yaml', errors='ignore')))"
+      register: create_chart_yaml
 
-    - name: Verify Triton Inference Server pod is running
-      shell: "kubectl -n {{ triton_namespace }} get pods -o wide"
-      environment:
-        KUBECONFIG: /etc/kubernetes/admin.conf
-      register: triton_status
-      retries: 15
-      delay: 20
-      until: "'Running' in triton_status.stdout"
-      when: "'k8s_master' in group_names and chart_dirs.results[1].stat.exists"
-      ignore_errors: yes
-      changed_when: false
+    - name: Create OpenWebUI templates directory
+      file:
+        path: "./openwebui-chart/templates"
+        state: directory
+        mode: '0755'
+      when: "'k8s_master' in group_names and (create_openwebui_chart.changed or (chart_dirs.results[2] is defined and chart_dirs.results[2].stat.exists and not lookup('file', './openwebui-chart/templates', errors='ignore')))"
+      register: create_templates_dir
+
+    - name: Create OpenWebUI deployment.yaml
+      copy:
+        dest: "./openwebui-chart/templates/deployment.yaml"
+        content: |
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: openwebui
+            namespace: {{ openwebui_namespace }}
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: openwebui
+            template:
+              metadata:
+                labels:
+                  app: openwebui
+              spec:
+                containers:
+                - name: openwebui
+                  image: ghcr.io/open-webui/open-webui:main
+                  imagePullPolicy: Always
+                  ports:
+                  - containerPort: 3000
+                  env:
+                  - name: OLLAMA_API_BASE_URL
+                    value: "http://ollama.{{ ollama_namespace }}.svc.cluster.local:11434"
+                  resources:
+                    limits:
+                      memory: "2Gi"
+                    requests:
+                      memory: "1Gi"
+      when: "'k8s_master' in group_names and (create_templates_dir.changed or (chart_dirs.results[2] is defined and chart_dirs.results[2].stat.exists and not lookup('file', './openwebui-chart/templates/deployment.yaml', errors='ignore')))"
+      register: create_deployment
+
+    - name: Create OpenWebUI service.yaml
+      copy:
+        dest: "./openwebui-chart/templates/service.yaml"
+        content: |
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: openwebui
+            namespace: {{ openwebui_namespace }}
+          spec:
+            selector:
+              app: openwebui
+            ports:
+            - port: 3001
+              targetPort: 3000
+            type: LoadBalancer
+      when: "'k8s_master' in group_names and (create_templates_dir.changed or (chart_dirs.results[2] is defined and chart_dirs.results[2].stat.exists and not lookup('file', './openwebui-chart/templates/service.yaml', errors='ignore')))"
+      register: create_service
 
     - name: Install OpenWebUI
-      shell: |
-        helm install openwebui ./openwebui-chart --namespace {{ openwebui_namespace }} --create-namespace --timeout 10m
+      block:
+        - name: Create OpenWebUI namespace
+          shell: |
+            kubectl create namespace {{ openwebui_namespace }} --dry-run=client -o yaml | kubectl apply -f -
+          environment:
+            KUBECONFIG: /etc/kubernetes/admin.conf
+          register: namespace_create
+          changed_when: namespace_create.rc == 0
+          
+        - name: Install OpenWebUI using Helm
+          shell: |
+            helm install openwebui ./openwebui-chart --namespace {{ openwebui_namespace }} --timeout 10m
+          environment:
+            KUBECONFIG: /etc/kubernetes/admin.conf
+          register: openwebui_install
+          retries: 2
+          delay: 30
+          until: openwebui_install.rc == 0
+      when: "'k8s_master' in group_names"
+      
+    - name: Wait for OpenWebUI pods to be created
+      shell: "kubectl get pods -n {{ openwebui_namespace }} -o name | wc -l"
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
-      when: "'k8s_master' in group_names and chart_dirs.results[2].stat.exists"
-      ignore_errors: yes
-      register: openwebui_install
-      changed_when: openwebui_install.rc == 0
-
+      register: openwebui_pods_count
+      retries: 10
+      delay: 15
+      until: openwebui_pods_count.stdout | int > 0
+      when: "'k8s_master' in group_names"
+      changed_when: false
+      
     - name: Verify OpenWebUI pod is running
-      shell: "kubectl -n {{ openwebui_namespace }} get pods -o wide"
+      shell: "kubectl get pods -n {{ openwebui_namespace }} -o jsonpath='{range .items[*]}{.status.phase}\\n{end}' | grep -v Running | wc -l"
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
-      register: openwebui_status
+      register: openwebui_not_running
       retries: 15
       delay: 20
-      until: "'Running' in openwebui_status.stdout"
-      when: "'k8s_master' in group_names and chart_dirs.results[2].stat.exists"
-      ignore_errors: yes
+      until: openwebui_not_running.stdout | int == 0
+      when: "'k8s_master' in group_names and openwebui_pods_count.stdout | int > 0"
       changed_when: false
 
     - name: Retrieve Kubernetes Dashboard Token
