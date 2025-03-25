@@ -490,6 +490,11 @@
         ollama_namespace: "ollama"
         triton_namespace: "triton-inference"
         openwebui_namespace: "openwebui"
+        web_search_enabled: "true"
+        google_api_key: ""  # Replace with your Google API key
+        google_cse_id: ""   # Replace with your Google CSE ID
+        serper_api_key: ""  # Optional, replace with your Serper API key
+        bing_search_api_key: ""  # Optional, replace with your Bing API key
       when: "'k8s_master' in group_names"
 
     - name: Install and configure Kubernetes Web Admin Interface
@@ -762,6 +767,16 @@
                     value: "0.0.0.0"
                   - name: PORT
                     value: "3000"
+                  - name: WEB_SEARCH_ENABLED
+                    value: "{{ web_search_enabled }}"
+                  - name: GOOGLE_API_KEY
+                    value: "{{ google_api_key }}"
+                  - name: GOOGLE_CSE_ID
+                    value: "{{ google_cse_id }}"
+                  - name: SERPER_API_KEY
+                    value: "{{ serper_api_key }}"
+                  - name: BING_SEARCH_API_KEY
+                    value: "{{ bing_search_api_key }}"
                   resources:
                     limits:
                       memory: "2Gi"
@@ -848,6 +863,11 @@
     ollama_namespace: "ollama"
     triton_namespace: "triton-inference"
     openwebui_namespace: "openwebui"
+    web_search_enabled: "true"
+    google_api_key: ""  # Replace with your Google API key
+    google_cse_id: ""   # Replace with your Google CSE ID
+    serper_api_key: ""  # Optional, replace with your Serper API key
+    bing_search_api_key: ""  # Optional, replace with your Bing API key
   tasks:
     - name: Install NVIDIA GPU Operator for Kubernetes GPU Sharing
       block:
