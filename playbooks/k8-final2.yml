@@ -726,22 +726,6 @@
         mode: '0755'
       when: "'k8s_master' in group_names"
 
-    - name: Create OpenWebUI configmap.yaml
-      copy:
-        dest: "./openwebui-chart/templates/configmap.yaml"
-        content: |
-          apiVersion: v1
-          kind: ConfigMap
-          metadata:
-            name: openwebui-config
-            namespace: {{ openwebui_namespace }}
-          data:
-            .env: |
-              OLLAMA_API_BASE_URL=http://ollama-service.{{ ollama_namespace }}.svc.cluster.local:11434
-              HOST=0.0.0.0
-              PORT=3000
-      when: "'k8s_master' in group_names"
-
     - name: Create OpenWebUI deployment.yaml
       copy:
         dest: "./openwebui-chart/templates/deployment.yaml"
@@ -767,19 +751,18 @@
                   imagePullPolicy: Always
                   ports:
                   - containerPort: 3000
-                  volumeMounts:
-                  - name: config-volume
-                    mountPath: /app/.env
-                    subPath: .env
+                  env:
+                  - name: OLLAMA_API_BASE_URL
+                    value: "http://ollama-service.{{ ollama_namespace }}.svc.cluster.local:11434"
+                  - name: HOST
+                    value: "0.0.0.0"
+                  - name: PORT
+                    value: "3000"
                   resources:
                     limits:
                       memory: "2Gi"
                     requests:
                       memory: "1Gi"
-                volumes:
-                - name: config-volume
-                  configMap:
-                    name: openwebui-config
       when: "'k8s_master' in group_names"
 
     - name: Create OpenWebUI service.yaml
