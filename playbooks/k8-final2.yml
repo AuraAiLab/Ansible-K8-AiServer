@@ -618,7 +618,7 @@
         kubectl create namespace {{ monitoring_namespace }} --dry-run=client -o yaml | kubectl apply -f -
         helm install prometheus prometheus-community/kube-prometheus-stack \
           --namespace {{ monitoring_namespace }} \
-          --values monitoring-values.yaml \
+          --values monitoring-values-simple.yaml \
           --wait --timeout 10m
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
