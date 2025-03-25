@@ -745,6 +745,10 @@
                 labels:
                   app: openwebui
               spec:
+                hostAliases:
+                - ip: "{{ ollama_service_ip | default('10.104.100.227') }}"
+                  hostnames:
+                  - "host.docker.internal"
                 containers:
                 - name: openwebui
                   image: ghcr.io/open-webui/open-webui:main
