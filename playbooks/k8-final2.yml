@@ -611,6 +611,50 @@
       register: metallb_direct
       changed_when: metallb_direct.rc == 0
       
+    - name: Verify MetalLB IP address pool configuration
+      shell: |
+        kubectl get ipaddresspools -n metallb-system default-pool -o jsonpath='{.spec.addresses[0]}' || echo "IPAddressPool not found"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: metallb_pool_check
+      when: "'k8s_master' in group_names"
+      changed_when: false
+    
+    - name: Verify MetalLB L2Advertisement configuration
+      shell: |
+        kubectl get l2advertisements -n metallb-system l2-advert -o jsonpath='{.spec.ipAddressPools[0]}' || echo "L2Advertisement not found"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: metallb_advert_check
+      when: "'k8s_master' in group_names"
+      changed_when: false
+    
+    - name: Re-apply MetalLB configuration if not properly configured
+      shell: |
+        cat <<EOF | kubectl apply -f -
+        apiVersion: metallb.io/v1beta1
+        kind: IPAddressPool
+        metadata:
+          name: default-pool
+          namespace: metallb-system
+        spec:
+          addresses:
+          - {{ metallb_ip_range }}
+        ---
+        apiVersion: metallb.io/v1beta1
+        kind: L2Advertisement
+        metadata:
+          name: l2-advert
+          namespace: metallb-system
+        spec:
+          ipAddressPools:
+          - default-pool
+        EOF
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: "'k8s_master' in group_names and ('IPAddressPool not found' in metallb_pool_check.stdout or 'L2Advertisement not found' in metallb_advert_check.stdout or metallb_pool_check.stdout != '{{ metallb_ip_range }}' or metallb_advert_check.stdout != 'default-pool')"
+      changed_when: true
+      
     - name: Install monitoring tools (Prometheus & Grafana)
       shell: |
         helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
