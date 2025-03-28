@@ -107,6 +107,34 @@ k8-ansible/
     └── monitoring/           # Monitoring configuration
 ```
 
+## Monitoring
+
+This branch contains enhanced monitoring capabilities for Kubernetes clusters with a focus on NVIDIA GPU monitoring. The monitoring stack includes:
+
+- Prometheus for metrics collection
+- Grafana for visualization
+- DCGM Exporter for NVIDIA GPU metrics
+- Persistent storage configuration for long-term metrics retention
+
+### NVIDIA GPU Dashboard
+
+A pre-configured Grafana dashboard for NVIDIA GPUs is provided in the `playbooks/monitoring-dashboards/Nvidia_GPU_dashboard.json` file. This dashboard includes:
+
+- GPU utilization metrics
+- Temperature monitoring (Fahrenheit)
+- VRAM usage statistics
+- Power consumption tracking
+- GPU and memory clock speeds
+
+To import this dashboard:
+1. Access your Grafana instance
+2. Navigate to Dashboards > Import
+3. Upload the JSON file or paste its contents
+4. Select your Prometheus data source
+5. Click Import
+
+The dashboard is optimized for NVIDIA RTX GPUs but works with all NVIDIA GPUs supported by the DCGM exporter.
+
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
