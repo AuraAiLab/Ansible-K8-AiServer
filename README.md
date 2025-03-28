@@ -107,6 +107,23 @@ k8-ansible/
     └── monitoring/           # Monitoring configuration
 ```
 
+## Monitoring
+
+The main branch includes a basic Prometheus and Grafana installation for monitoring your Kubernetes cluster.
+
+For advanced monitoring capabilities, including:
+- Persistent storage for long-term metrics retention
+- GPU monitoring via DCGM exporter
+- Customized Grafana dashboards
+- Detailed monitoring configuration options
+
+Check out the `feature/enhanced-monitoring` branch:
+```bash
+git checkout feature/enhanced-monitoring
+```
+
+This branch includes additional playbooks and a comprehensive [monitoring guide](docs/monitoring-guide.md) for setting up a production-grade monitoring solution.
+
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
