@@ -1,0 +1,101 @@
+# Simplified values for kube-prometheus-stack without persistent storage
+prometheus:
+  prometheusSpec:
+    retention: 15d
+    resources:
+      requests:
+        memory: 512Mi
+        cpu: 500m
+      limits:
+        memory: 2Gi
+        cpu: 1000m
+
+alertmanager:
+  alertmanagerSpec:
+    resources:
+      requests:
+        memory: 256Mi
+        cpu: 100m
+      limits:
+        memory: 512Mi
+        cpu: 200m
+
+grafana:
+  adminPassword: "AiLabMonitoring123"
+  persistence:
+    enabled: false
+  service:
+    type: LoadBalancer
+  resources:
+    requests:
+      memory: 256Mi
+      cpu: 100m
+    limits:
+      memory: 512Mi
+      cpu: 200m
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: 'kubernetes'
+          orgId: 1
+          folder: 'Kubernetes'
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/kubernetes
+        - name: 'nvidia'
+          orgId: 1
+          folder: 'NVIDIA'
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/nvidia
+  dashboards:
+    kubernetes:
+      k8s-system-resources:
+        gnetId: 10856
+        revision: 1
+        datasource: Prometheus
+      k8s-deployment-statefulset:
+        gnetId: 8588
+        revision: 1
+        datasource: Prometheus
+    nvidia:
+      nvidia-dcgm:
+        gnetId: 12239
+        revision: 1
+        datasource: Prometheus
+
+nodeExporter:
+  resources:
+    requests:
+      memory: 64Mi
+      cpu: 100m
+    limits:
+      memory: 128Mi
+      cpu: 200m
+
+kubeStateMetrics:
+  resources:
+    requests:
+      memory: 64Mi
+      cpu: 100m
+    limits:
+      memory: 128Mi
+      cpu: 200m
+
+# Enable ServiceMonitor for NVIDIA DCGM Exporter
+additionalServiceMonitors:
+  - name: dcgm-exporter
+    selector:
+      matchLabels:
+        app: dcgm-exporter
+    namespaceSelector:
+      matchNames:
+        - gpu-operator
+    endpoints:
+      - port: metrics
+        interval: 15s

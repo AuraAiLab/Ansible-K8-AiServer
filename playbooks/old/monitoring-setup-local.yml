@@ -1,0 +1,81 @@
+---
+- hosts: localhost
+  connection: local
+  become: yes
+  vars:
+    monitoring_namespace: "monitoring"
+  tasks:
+    - name: Check if NVIDIA drivers are installed and working
+      command: nvidia-smi
+      register: nvidia_smi_result
+      changed_when: false
+      failed_when: false
+      
+    - name: Install monitoring tools (Prometheus & Grafana)
+      shell: |
+        helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+        helm repo update
+        kubectl create namespace {{ monitoring_namespace }} --dry-run=client -o yaml | kubectl apply -f -
+        helm install prometheus prometheus-community/kube-prometheus-stack \
+          --namespace {{ monitoring_namespace }} \
+          --values /tmp/monitoring-values.yaml \
+          --wait --timeout 10m
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: monitoring_install
+      retries: 2
+      delay: 60
+      until: monitoring_install.rc == 0
+
+    - name: Install NVIDIA DCGM Exporter for GPU monitoring (if NVIDIA GPUs are present)
+      shell: |
+        kubectl apply -f /tmp/dcgm-exporter-setup.yaml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: dcgm_install
+      retries: 2
+      delay: 30
+      until: dcgm_install.rc == 0
+      when: "nvidia_smi_result.rc == 0"
+      changed_when: dcgm_install.rc == 0
+      ignore_errors: yes
+
+    - name: Verify Prometheus/Grafana pods are running
+      shell: "kubectl get pods -n {{ monitoring_namespace }}"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: monitoring_status
+      retries: 20
+      delay: 20
+      until: "'Running' in monitoring_status.stdout"
+      changed_when: false
+      
+    - name: Retrieve Grafana service details
+      shell: |
+        kubectl get svc -n {{ monitoring_namespace }} prometheus-grafana -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: grafana_service_ip
+      changed_when: false
+      ignore_errors: yes
+      
+    - name: Display Grafana access information
+      debug:
+        msg: 
+          - "Grafana dashboard available at: http://{{ grafana_service_ip.stdout }}:80"
+          - "Default credentials: admin / AiLabMonitoring123"
+      when: "grafana_service_ip.stdout != ''"
+
+    - name: Retrieve Prometheus service details
+      shell: |
+        kubectl get svc -n {{ monitoring_namespace }} prometheus-kube-prometheus-prometheus -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: prometheus_service_ip
+      changed_when: false
+      ignore_errors: yes
+      
+    - name: Display Prometheus access information
+      debug:
+        msg: "Prometheus dashboard available at: http://{{ prometheus_service_ip.stdout }}:9090"
+      when: "prometheus_service_ip.stdout != ''"

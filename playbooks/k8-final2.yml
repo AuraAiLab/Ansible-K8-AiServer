@@ -616,7 +616,10 @@
         helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
         helm repo update
         kubectl create namespace {{ monitoring_namespace }} --dry-run=client -o yaml | kubectl apply -f -
-        helm install prometheus prometheus-community/kube-prometheus-stack --namespace {{ monitoring_namespace }} --wait --timeout 10m
+        helm install prometheus prometheus-community/kube-prometheus-stack \
+          --namespace {{ monitoring_namespace }} \
+          --values monitoring-values-simple.yaml \
+          --wait --timeout 10m
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
       register: monitoring_install
@@ -625,6 +628,19 @@
       until: monitoring_install.rc == 0
       when: "'k8s_master' in group_names"
       changed_when: monitoring_install.rc == 0
+
+    - name: Install NVIDIA DCGM Exporter for GPU monitoring (if NVIDIA GPUs are present)
+      shell: |
+        kubectl apply -f dcgm-exporter-setup.yaml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: dcgm_install
+      retries: 2
+      delay: 30
+      until: dcgm_install.rc == 0
+      when: "'k8s_master' in group_names and nvidia_smi_result.rc == 0"
+      changed_when: dcgm_install.rc == 0
+      ignore_errors: yes
 
     - name: Verify Prometheus/Grafana pods are running
       shell: "kubectl get pods -n {{ monitoring_namespace }} | grep -c Running"
@@ -636,7 +652,24 @@
       until: monitoring_status.stdout | int > 0
       when: "'k8s_master' in group_names"
       changed_when: false
-
+      
+    - name: Retrieve Grafana service details
+      shell: |
+        kubectl get svc -n {{ monitoring_namespace }} prometheus-grafana -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: grafana_service_ip
+      when: "'k8s_master' in group_names"
+      changed_when: false
+      ignore_errors: yes
+      
+    - name: Display Grafana access information
+      debug:
+        msg: 
+          - "Grafana dashboard available at: http://{{ grafana_service_ip.stdout }}:80"
+          - "Default credentials: admin / AiLabMonitoring123"
+      when: "'k8s_master' in group_names and grafana_service_ip.stdout != ''"
+      
     - name: Ensure CoreDNS is deployed
       shell: |
         set -e
