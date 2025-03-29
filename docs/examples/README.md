@@ -370,7 +370,8 @@ spec:
 Example Ollama configuration:
 
 ```yaml
-# ollama-deployment.yaml
+# ollama-deployment.yaml (Main Branch - Single GPU)
+```yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -395,6 +396,8 @@ spec:
         env:
         - name: OLLAMA_HOST
           value: "0.0.0.0"
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0"
         resources:
           requests:
             memory: "4Gi"
@@ -410,6 +413,79 @@ spec:
       - name: ollama-data
         persistentVolumeClaim:
           claimName: ollama-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: ollama
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 11434
+    targetPort: 11434
+    name: api
+  selector:
+    app: ollama
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-data
+  namespace: ollama
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+```
+
+### Ollama Deployment (Feature Branch - Dual GPU)
+
+```yaml
+# ollama-deployment-dual-gpu.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: ollama
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+    spec:
+      containers:
+      - name: ollama
+        image: ollama/ollama:latest
+        ports:
+        - containerPort: 11434
+          name: api
+        env:
+        - name: OLLAMA_HOST
+          value: "0.0.0.0"
+        # No CUDA_VISIBLE_DEVICES to allow access to all GPUs
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "2"
+          limits:
+            memory: "8Gi"
+            cpu: "4"
+            nvidia.com/gpu: 2
+        volumeMounts:
+        - name: ollama-data
+          mountPath: /root/.ollama
+      volumes:
+      - name: ollama-data
+        persistentVolumeClaim:
+          claimName: ollama-data
+```
 ---
 apiVersion: v1
 kind: Service

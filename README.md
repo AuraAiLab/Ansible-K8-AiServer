@@ -79,6 +79,7 @@ The deployment creates a fully-functional Kubernetes cluster with the following 
 - [Installation Guide](docs/installation-guide.md): Complete step-by-step installation instructions
 - [Troubleshooting Guide](docs/troubleshooting/README.md): Solutions for common issues
 - [Configuration Examples](docs/examples/README.md): Example configuration files for various scenarios
+ - [Ollama GPU Configuration](docs/ollama-gpu-configuration.md): GPU setup for single and dual GPU deployments
 - [Issues and Fixes](ISSUES.md): Documented issues and their resolutions
 
 ## Project Structure

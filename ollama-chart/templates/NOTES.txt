@@ -1,0 +1,26 @@
+Thank you for installing {{ .Chart.Name }}.
+
+The Ollama server has been deployed with a single GPU configuration.
+
+Your release is named {{ .Release.Name }}.
+
+To check the status of your deployment, run:
+  kubectl get deployment -n {{ .Values.namespace }} ollama
+
+To access the Ollama API:
+{{- if contains "ClusterIP" .Values.service.type }}
+  kubectl port-forward -n {{ .Values.namespace }} svc/ollama {{ .Values.service.port }}:{{ .Values.service.port }}
+  
+  Then access Ollama API at: http://127.0.0.1:{{ .Values.service.port }}
+{{- else if contains "NodePort" .Values.service.type }}
+  export NODE_PORT=$(kubectl get -n {{ .Values.namespace }} -o jsonpath="{.spec.ports[0].nodePort}" services ollama)
+  export NODE_IP=$(kubectl get nodes -o jsonpath="{.items[0].status.addresses[0].address}")
+  
+  Then access Ollama API at: http://$NODE_IP:$NODE_PORT
+{{- else if contains "LoadBalancer" .Values.service.type }}
+  NOTE: It may take a few minutes for the LoadBalancer IP to be available.
+  
+  export SERVICE_IP=$(kubectl get svc -n {{ .Values.namespace }} ollama --template "{{ "{{ range (index .status.loadBalancer.ingress 0) }}{{ . }}{{ end }}" }}")
+  
+  Then access Ollama API at: http://$SERVICE_IP:{{ .Values.service.port }}
+{{- end }}

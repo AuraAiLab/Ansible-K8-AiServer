@@ -1,0 +1,35 @@
+# Default values for ollama chart
+
+replicaCount: 1
+
+image:
+  repository: ollama/ollama
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 11434
+
+resources:
+  limits:
+    cpu: 4
+    memory: 16Gi
+    nvidia.com/gpu: 2
+  requests:
+    cpu: 1
+    memory: 4Gi
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+persistence:
+  enabled: true
+  size: 20Gi
+  storageClass: ""
+
+# Namespace to deploy Ollama in
+namespace: ollama
