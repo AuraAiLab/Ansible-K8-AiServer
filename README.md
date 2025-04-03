@@ -130,7 +130,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## Contributors
 
-- Your Name <your.email@example.com>
+- E.E. - AuraAi@SDSitGroup.com
 
 ## Acknowledgments
 
